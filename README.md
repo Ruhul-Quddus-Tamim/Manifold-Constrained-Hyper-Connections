@@ -45,7 +45,7 @@ I create a simple character-level vocabulary and a PyTorch `Dataset` to handle t
 
 ## Model Architecture
 
-We now implement the core components of the mHC architecture. The implementation is modular, allowing us to easily swap between `StandardConnection`, `HCModule`, and `mHCModule`.
+Implement the core components of the mHC architecture. The implementation is modular, allowing us to easily swap between `StandardConnection`, `HCModule`, and `mHCModule`.
 
 ### Core Components:
 
