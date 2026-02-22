@@ -1,4 +1,4 @@
-"""Model components for mHC: RMSNorm, Sinkhorn-Knopp, connection modules, Transformer."""
+"""Model components for mHC: RMSNorm, log-space Sinkhorn, connection modules, Transformer."""
 
 import math
 from typing import Dict, Any
@@ -22,21 +22,33 @@ class RMSNorm(nn.Module):
         return self.weight * x_normed
 
 
-class SinkhornKnopp(nn.Module):
-    """Projects a matrix to be doubly stochastic using Sinkhorn-Knopp algorithm.
-    Follows Equation (9) from the paper.
+class SinkhornLog(nn.Module):
+    """Projects logits to a doubly stochastic matrix using log-space Sinkhorn-Knopp.
+
+    Operating entirely in log-space avoids the exp/divide cycles of standard
+    Sinkhorn, preventing overflow/underflow and giving more stable gradients.
+    Temperature tau controls sharpness: smaller tau -> closer to a permutation.
+    Matches the reference implementation's sinkhorn_log (arXiv:2409.19606).
     """
 
-    def __init__(self, iterations: int = 20):
+    def __init__(self, iterations: int = 10, tau: float = 0.05):
         super().__init__()
         self.iterations = iterations
+        self.tau = tau
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.exp()
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        n = logits.shape[-1]
+        Z = logits / self.tau
+        log_marginal = torch.zeros(n, device=logits.device, dtype=logits.dtype)
+
+        u = torch.zeros(logits.shape[:-1], device=logits.device, dtype=logits.dtype)
+        v = torch.zeros_like(u)
+
         for _ in range(self.iterations):
-            x = x / x.sum(dim=-2, keepdim=True)
-            x = x / x.sum(dim=-1, keepdim=True)
-        return x
+            u = log_marginal - torch.logsumexp(Z + v.unsqueeze(-2), dim=-1)
+            v = log_marginal - torch.logsumexp(Z + u.unsqueeze(-1), dim=-2)
+
+        return torch.exp(Z + u.unsqueeze(-1) + v.unsqueeze(-2))
 
 
 class ConnectionModule(nn.Module):
@@ -48,22 +60,17 @@ class ConnectionModule(nn.Module):
 
 class mHCModule(ConnectionModule):
     """Implements the Manifold-Constrained Hyper-Connection (mHC).
-    Follows Equations (7) and (8).
-    Optional residual identity mix: H_res = (1-α)*I + α*S for better accuracy.
+    Follows Equations (7) and (8) from the paper (arXiv:2512.24880).
+    H_pre = sigmoid(unconstrained), H_post = 2*sigmoid(unconstrained),
+    H_res = SinkhornLog(logits, tau) -> doubly stochastic.
+    Uses log-space Sinkhorn for numerical stability (no exp/divide overflow).
+    b_res is initialized to scaled identity so H_res starts near identity.
     """
 
-    def __init__(
-        self,
-        C: int,
-        n: int,
-        sk_iters: int = 10,
-        residual_identity_mix: bool = True,
-        residual_alpha_init: float = 0.01,
-    ):
+    def __init__(self, C: int, n: int, sk_iters: int = 10, sk_tau: float = 0.05):
         super().__init__()
         self.n = n
         self.C = C
-        self.residual_identity_mix = residual_identity_mix
         self.norm = RMSNorm(n * C)
 
         self.phi_pre = nn.Linear(n * C, n, bias=False)
@@ -75,15 +82,12 @@ class mHCModule(ConnectionModule):
         self.a_post = nn.Parameter(torch.full((1,), 0.01))
         self.b_post = nn.Parameter(torch.zeros(1, 1, n))
         self.a_res = nn.Parameter(torch.full((1,), 0.01))
-        self.b_res = nn.Parameter(torch.zeros(1, 1, n, n))
+        # Initialize b_res so diagonal logits dominate -> SinkhornLog ≈ I at init
+        self.b_res = nn.Parameter(
+            torch.eye(n).unsqueeze(0).unsqueeze(0) * 5.0
+        )
 
-        self.sinkhorn = SinkhornKnopp(iterations=sk_iters)
-
-        # Residual identity mix: H_res = (1-α)*I + α*S (tokenbender-style)
-        if residual_identity_mix:
-            self.residual_alpha = nn.Parameter(
-                torch.tensor(residual_alpha_init).clamp(1e-4, 1.0)
-            )
+        self.sinkhorn = SinkhornLog(iterations=sk_iters, tau=sk_tau)
 
     def forward(self, x: torch.Tensor, sublayer: nn.Module) -> torch.Tensor:
         B, S, _, _ = x.shape
@@ -103,15 +107,7 @@ class mHCModule(ConnectionModule):
 
         H_pre = torch.sigmoid(H_pre_unconstrained)
         H_post = 2 * torch.sigmoid(H_post_unconstrained)
-        H_res_sinkhorn = self.sinkhorn(H_res_unconstrained)
-        if self.residual_identity_mix:
-            alpha = torch.sigmoid(self.residual_alpha)  # keep in (0, 1)
-            I = torch.eye(
-                self.n, device=x.device, dtype=x.dtype
-            ).view(1, 1, self.n, self.n)
-            H_res = (1 - alpha) * I + alpha * H_res_sinkhorn
-        else:
-            H_res = H_res_sinkhorn
+        H_res = self.sinkhorn(H_res_unconstrained)
 
         x_normed_reshaped = x_normed.view(B, S, self.n, self.C)
         h_in = torch.einsum("bsin,bsnc->bsc", H_pre, x_normed_reshaped)
@@ -246,15 +242,13 @@ class HyperTransformer(nn.Module):
                     config["C"],
                     config["n"],
                     sk_iters=config.get("sinkhorn_iters", 10),
-                    residual_identity_mix=config.get("mhc_residual_identity_mix", True),
-                    residual_alpha_init=config.get("mhc_residual_alpha", 0.01),
+                    sk_tau=config.get("sinkhorn_tau", 0.05),
                 )
                 conn2 = mHCModule(
                     config["C"],
                     config["n"],
                     sk_iters=config.get("sinkhorn_iters", 10),
-                    residual_identity_mix=config.get("mhc_residual_identity_mix", True),
-                    residual_alpha_init=config.get("mhc_residual_alpha", 0.01),
+                    sk_tau=config.get("sinkhorn_tau", 0.05),
                 )
             elif config["connection_type"] == "hc":
                 conn1 = HCModule(config["C"], config["n"])
@@ -315,12 +309,11 @@ def build_model_config(
     connection_type: str = "mhc",
     C: int = 64,
     n: int = 4,
-    n_layers: int = 6,
+    n_layers: int = 12,
     n_heads: int = 4,
     dropout: float = 0.1,
     sinkhorn_iters: int = 10,
-    mhc_residual_identity_mix: bool = True,
-    mhc_residual_alpha: float = 0.01,
+    sinkhorn_tau: float = 0.05,
 ) -> Dict[str, Any]:
     """Build model configuration dict."""
     return {
@@ -333,6 +326,5 @@ def build_model_config(
         "dropout": dropout,
         "connection_type": connection_type,
         "sinkhorn_iters": sinkhorn_iters,
-        "mhc_residual_identity_mix": mhc_residual_identity_mix,
-        "mhc_residual_alpha": mhc_residual_alpha,
+        "sinkhorn_tau": sinkhorn_tau,
     }
